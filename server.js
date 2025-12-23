@@ -10,9 +10,9 @@ app.get('/', (req, res) => {
   res.send('Hello, World!\n');
 });
 
-// New endpoint - returns "Good evening" as specified by user
-app.get('/evening', (req, res) => {
-  res.send('Good evening');
+// New endpoint - returns "Good morning" as specified by user
+app.get('/morning', (req, res) => {
+  res.send('Good morning');
 });
 
 app.listen(port, hostname, () => {

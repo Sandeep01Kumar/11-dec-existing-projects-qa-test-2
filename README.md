@@ -59,18 +59,18 @@ curl http://127.0.0.1:3000/
 Hello, World!
 ```
 
-### GET /evening
+### GET /morning
 
-Returns an evening greeting.
+Returns a morning greeting.
 
 **Request:**
 ```bash
-curl http://127.0.0.1:3000/evening
+curl http://127.0.0.1:3000/morning
 ```
 
 **Response:**
 ```
-Good evening
+Good morning
 ```
 
 ## Testing the Endpoints
@@ -81,8 +81,8 @@ You can test the endpoints using `curl` or any HTTP client:
 # Test the root endpoint
 curl http://127.0.0.1:3000/
 
-# Test the evening endpoint
-curl http://127.0.0.1:3000/evening
+# Test the morning endpoint
+curl http://127.0.0.1:3000/morning
 ```
 
 ## Project Structure
