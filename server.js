@@ -64,20 +64,29 @@ function describeError(value) {
 // peer almost nothing, so an unbounded record per event would let that peer spend
 // the server's stderr buffer, log storage and event-loop budget at will. Each
 // fault is recorded per event while the window's quota lasts; the records past it
-// are counted and reported when the window rolls, so no fault goes unnoticed
-// while the cost per window stays fixed.
+// are counted, and that count is reported when the window rolls and again on
+// every terminal path, so a suppressed fault is still accounted for by number
+// even though its own record was dropped, and the cost per window stays fixed.
 const FAULT_LOG_WINDOW_MS = 60000;
 const FAULT_LOG_WINDOW_LIMIT = 10;
 const faultLog = { windowStart: Date.now(), logged: 0, suppressed: 0 };
 
 // RC1/RC4: reports whatever the quota suppressed, as one bounded line holding one
-// integer. Called when a window rolls and once more from shutdown(), so faults
-// counted in the final window are not lost at exit.
+// integer. Called when a window rolls and from every terminal path — the start of
+// shutdown, the drain's completion, and the forced stop — because a fault
+// suppressed after one report would otherwise be lost at exit, including one a
+// peer provokes during the drain itself. The write is contained because those
+// callers are terminal: a throw here must not displace the exit that follows it.
 function reportSuppressedFaults() {
   if (faultLog.suppressed === 0) return;
   const suppressed = faultLog.suppressed;
   faultLog.suppressed = 0;
-  console.error(`Client fault records suppressed: ${suppressed}.`);
+  try {
+    console.error(`Client fault records suppressed: ${suppressed}.`);
+  } catch {
+    // The counter is already cleared, so the exit status the caller is about to
+    // set is the only signal left; re-reporting a failed report cannot help.
+  }
 }
 
 // RC1/RC4: records one socket fault. `label` is a fixed string and the error is
@@ -175,9 +184,16 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// RC5: apply explicit timeouts, replacing Node's version-dependent defaults.
-// Assigned before listen(), which is where Node reads them, so the whole policy
-// is in force before the server accepts anything.
+// RC5: apply the three explicit timeouts, replacing Node's version-dependent
+// defaults, and assign them before listen() so the policy is in force before the
+// first connection is accepted. They are deadlines rather than exact wall-clock
+// ceilings: Node reaps an expired connection at the next of its periodic scans,
+// so the effective header and request ceilings are the configured value plus up
+// to one scan interval, and a runtime may hold an idle kept-alive socket a little
+// past keepAliveTimeout. Tightening that granularity, and bounding how many
+// sockets a peer may hold or how many exchanges it may run through one, are
+// outside the specified change: a socket-count ceiling is a deployment control,
+// and the default bind is loopback-only.
 server.requestTimeout = REQUEST_TIMEOUT_MS;
 server.headersTimeout = HEADERS_TIMEOUT_MS;
 server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
@@ -201,6 +217,7 @@ function armForcedStop() {
   forcedStopTimer = setTimeout(() => {
     try {
       console.error('Forced shutdown after timeout.');
+      reportSuppressedFaults();            // faults provoked during the drain, before this exit
       // Guarded because the API exists only from Node >= 18.2.
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     } finally {
@@ -215,6 +232,7 @@ function armForcedStop() {
 // flight reaches close() with nothing listening — which is a clean stop rather
 // than a close failure, so it exits with the pending status like any other.
 function onServerClosed(err) {
+  reportSuppressedFaults();                 // faults provoked during the drain, before either exit
   if (err && readErrorToken(err, 'code') !== 'ERR_SERVER_NOT_RUNNING') {
     console.error(`Error during server close: ${describeError(err)}`);
     process.exit(1);
@@ -233,7 +251,7 @@ function shutdown(signal, exitCode = 1) {
   shuttingDown = true;
   try {
     console.log(`${signal} received: closing server gracefully...`);
-    reportSuppressedFaults();               // final flush, so counted faults are not lost at exit
+    reportSuppressedFaults();               // what is counted so far; the terminal paths report again
     server.close(onServerClosed);           // stop accepting new connections, drain in-flight
   } finally {
     // RC4: idle keep-alive sockets carry no request and would otherwise make the
