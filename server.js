@@ -17,17 +17,50 @@ const HEADERS_TIMEOUT_MS = 20000;
 const KEEP_ALIVE_TIMEOUT_MS = 5000;
 const SHUTDOWN_TIMEOUT_MS = 10000;
 
+// RC5: how often the header and request deadlines above are actually enforced.
+// Node does not arm a per-socket timer for them; it scans the incomplete
+// connections periodically and reaps whatever has expired since the last pass, so
+// this interval is the whole of the enforcement error and each deadline is really
+// its configured value plus up to one interval. Left at Node's 30000 ms default
+// that made the 20 s header deadline anything from 20 s to 50 s, and the 30 s
+// request deadline anything from 30 s to 60 s, decided only by where a connection
+// happened to fall in the scan grid — the opposite of the deterministic behavior
+// the deadlines are declared for. Setting it explicitly bounds them at 25 s and
+// 35 s and pins the granularity to this file rather than to the runtime's default,
+// for the same reason the deadlines themselves are set here.
+const CONNECTIONS_CHECK_INTERVAL_MS = 5000;
+
 // RC1: no thrown value or rejection reason is ever handed to `console.*`, which
 // would render its message, stack, `cause` chain and every enumerable property —
 // any of which can carry a credential or personal data — and would consult a
 // custom inspection hook on the value, running caller-supplied code inside
-// handlers that include the fatal ones. Only these three fields are read, and
-// only when the value already has the short plain-identifier shape Node's own
-// `name`, `code` and `syscall` carry, which admits no control character, quote or
-// newline that could forge a second log record.
+// handlers that include the fatal ones. Of its fields only these three are read
+// as identifier tokens, and only when the value already has the short plain
+// shape Node's own `name`, `code` and `syscall` carry, which admits no control
+// character, quote or newline that could forge a second log record.
 const MAX_ERROR_TOKEN_LENGTH = 48;
 const ERROR_TOKEN_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const ALLOWLISTED_ERROR_FIELDS = ['name', 'code', 'syscall'];
+
+// RC1: the failure's own description is rendered as well, because without it a
+// record names a category and nothing else — `Uncaught exception: name=Error` is
+// then the whole of what an operator is paged on, and two unrelated faults that
+// share a `name` are indistinguishable. A message is free-form text rather than
+// an identifier, so it cannot pass the token shape above and is admitted under
+// its own discipline instead: it is rendered only when it already is a string,
+// so a value that supplies something else is never coerced and no `toString` or
+// inspection hook of its own ever runs; every run of control characters, line
+// separators and whitespace collapses to a single space, so no fragment of it
+// can begin a second log record; it is capped, so one record stays bounded
+// whatever the value carries; and it is emitted inside double quotes with any
+// quote of its own replaced, so it cannot close its field early and forge a
+// `name=` or `code=` token beside the genuine ones. `stack` and `cause` stay
+// unrendered: a stack exposes internal paths, and a `cause` is another arbitrary
+// value with its own message, stack and enumerable properties.
+const MAX_ERROR_MESSAGE_LENGTH = 200;
+const ERROR_MESSAGE_UNSAFE_PATTERN = /[\s\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g;
+const ERROR_MESSAGE_QUOTE_PATTERN = /"/g;
+const ERROR_MESSAGE_TRUNCATION_MARK = ' (truncated)';
 
 // RC1: reads one allowlisted field — the token itself, a fixed marker when the
 // field is present in some other shape, `undefined` when absent. Guarded because
@@ -45,18 +78,65 @@ function readErrorToken(value, field) {
   }
 }
 
+// RC1: renders one free-form message as a bounded, single-line, self-terminating
+// quoted field, or `undefined` when sanitising leaves nothing for a field to
+// carry. The cap is applied to the raw text before the rewriting, so a value
+// that arrives arbitrarily long cannot make the log path itself expensive, and a
+// raw length past the cap is exactly what marks the rendered field truncated.
+function renderErrorMessage(message) {
+  const truncated = message.length > MAX_ERROR_MESSAGE_LENGTH;
+  let head = message.slice(0, MAX_ERROR_MESSAGE_LENGTH);
+  // A cut must not land inside a surrogate pair, whose remaining half would
+  // render as a replacement character instead of the text it came from.
+  const lastUnit = head.charCodeAt(head.length - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) head = head.slice(0, -1);
+  const text = head
+    .replace(ERROR_MESSAGE_UNSAFE_PATTERN, ' ')
+    .replace(ERROR_MESSAGE_QUOTE_PATTERN, "'")
+    .trim();
+  if (text.length === 0) return undefined;
+  return `"${truncated ? text + ERROR_MESSAGE_TRUNCATION_MARK : text}"`;
+}
+
+// RC1: reads the message the way readErrorToken reads a token, carrying the same
+// fixed markers — one present in some other shape, or unreadable because a
+// hostile value made it a getter that throws — and `undefined` when it is absent
+// or sanitises away. A marker is emitted bare while real content is always
+// quoted, so a message whose text is literally `unreadable` cannot be mistaken
+// for the marker of one.
+function readErrorMessage(value) {
+  try {
+    const message = value.message;
+    if (message === undefined || message === null) return undefined;
+    if (typeof message !== 'string') return 'non-string';
+    return renderErrorMessage(message);
+  } catch {
+    return 'unreadable';
+  }
+}
+
 // RC1: the shared log-safe rendering of any thrown value — a bounded summary of
-// the allowlisted tokens alone, with no message, stack, `cause` or free-form
-// property content. A primitive is reduced to its type, because the value itself
-// is exactly what may be sensitive.
+// the allowlisted tokens and the sanitised message alone, with no stack, `cause`
+// or other free-form property content. The message is rendered last, so its own
+// text can never be read as the key of a field following it. A primitive is
+// reduced to its type, because the value itself is exactly what may be
+// sensitive; a thrown or rejected string is the one exception, since there the
+// value IS the failure's description, and it is rendered under the same
+// discipline as an error's own message.
 function describeError(value) {
   if (value === null) return 'type=null';
+  if (typeof value === 'string') {
+    const message = renderErrorMessage(value);
+    return message === undefined ? 'type=string' : `type=string message=${message}`;
+  }
   if (typeof value !== 'object') return `type=${typeof value}`;
   const fields = [];
   for (const field of ALLOWLISTED_ERROR_FIELDS) {
     const token = readErrorToken(value, field);
     if (token !== undefined) fields.push(`${field}=${token}`);
   }
+  const message = readErrorMessage(value);
+  if (message !== undefined) fields.push(`message=${message}`);
   return fields.length > 0 ? fields.join(' ') : 'type=object';
 }
 
@@ -108,19 +188,35 @@ function logClientFault(label, err) {
   console.error(`${label}: ${describeError(err)}`);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHECK_INTERVAL_MS }, (req, res) => {
   // RC1: every response this handler produces — success or failure — is written by
   // this one-shot, state-aware responder, so each request yields exactly one
   // terminal response. Guarding only the status/header mutation is not enough: an
   // unconditional res.end() from a later failure path would append its body under
   // an already-committed status, call end() on a finished response and schedule
   // ERR_STREAM_WRITE_AFTER_END, or write to a destroyed response.
-  let responded = false;
+  //
+  // What makes a response terminal is the state of the response itself, not a flag
+  // set on the intent to write one: Node marks `writableEnded` (and `headersSent`)
+  // the moment end() succeeds, so that state is an exact record of what the client
+  // was actually sent. A flag set before the write also silenced the paths that had
+  // sent nothing — which left the 400 below unreachable, because every synchronous
+  // path here writes before an asynchronous stream error can arrive, and turned a
+  // write that failed having sent nothing into no response at all. Reading the state
+  // keeps the response open to a terminal status for exactly as long as one can
+  // still be delivered, and closed the moment one has been.
+  let responseSpent = false;
+  const canRespond = () => !responseSpent && !res.destroyed && !res.writableEnded && !res.headersSent;
+  // RC1: true only while the handler's own try/catch below is still on the stack
+  // beneath this responder. A write failure is escalated to that catch and nowhere
+  // else, so a failure raised from the catch itself, or from an asynchronous stream
+  // listener, is reported here rather than re-thrown past the handler — where it
+  // would reach the process-level uncaughtException net and stop a healthy server
+  // over a single request.
+  let writeFailureEscalates = true;
   const respond = (statusCode, headers, body) => {
-    if (responded) return;                  // first writer wins; later paths are no-ops
-    responded = true;
-    if (res.destroyed || res.writableEnded) {
-      return;
+    if (responseSpent || res.destroyed || res.writableEnded) {
+      return;                               // a terminal response is already spent
     }
     if (res.headersSent) {
       // The status line is already on the wire, so this status can no longer be
@@ -136,17 +232,26 @@ const server = http.createServer((req, res) => {
       }
       res.end(body);                        // body is omitted for HEAD: headers only
     } catch (writeErr) {
-      // If the socket failed mid-write there is nothing left to send, so the
-      // responder reports the failure and never raises a secondary one.
+      // RC1: a write that failed having sent nothing leaves the response still able
+      // to carry a status, so the failure is escalated to the handler's catch — the
+      // one place that maps an unexpected failure onto 500 — instead of ending here
+      // with nothing on the wire. The escalated 500 is written by the next respond()
+      // call, which proceeds because the state checked above is still writable.
+      if (writeFailureEscalates && canRespond()) throw writeErr;
+      // Otherwise the socket itself failed mid-write and no status can be delivered,
+      // so the responder reports the failure and never raises a secondary one.
       console.error(`Failed to write response: ${describeError(writeErr)}`);
       if (!res.destroyed) res.destroy();
     }
   };
 
   // RC1: handling the request stream's errors here is what keeps a socket fault
-  // from being emitted as an unhandled 'error' event on `req`. The one-shot
-  // responder is what keeps the 400 terminal, so a repeated stream error on the
-  // same request stays handled.
+  // from being emitted as an unhandled 'error' event on `req`. The fault arrives
+  // asynchronously, so this 400 is delivered only while nothing has been sent on the
+  // response yet; a fault on a request whose answer already reached the wire leaves
+  // that answer intact and is recorded on its own. The state gate in the responder is
+  // what keeps the 400 terminal, so a repeated stream error on the same request
+  // stays handled.
   req.on('error', (err) => {
     logClientFault('Request stream error', err);
     respond(400, { 'Content-Type': 'text/plain' }, 'Bad Request\n');
@@ -156,13 +261,20 @@ const server = http.createServer((req, res) => {
   // path attempts a write on it either.
   res.on('error', (err) => {
     logClientFault('Response stream error', err);
-    responded = true;
+    responseSpent = true;
   });
 
   try {
     // RC3: input validation — GET and HEAD are the only methods this endpoint
     // serves, and a rejection advertises them in `Allow` so a client can correct
-    // the request rather than guess at what is supported.
+    // the request rather than guess at what is supported. The rejection covers every
+    // method the Node HTTP layer delivers to this listener, which is the whole of
+    // what this handler is able to answer: a malformed method token is answered 400
+    // by Node's own request parser before the request reaches here, and CONNECT is
+    // routed to the server's 'connect' event rather than to a request listener, so
+    // with no listener for it Node closes the tunnel attempt itself. Both of those
+    // stay with the protocol layer, because answering them with this 405 would mean
+    // adding a connect responder — surface beyond the specified change.
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       respond(405, { 'Allow': 'GET, HEAD', 'Content-Type': 'text/plain' }, 'Method Not Allowed\n');
       return;
@@ -178,22 +290,30 @@ const server = http.createServer((req, res) => {
   } catch (err) {
     // RC1: catch-all so an unexpected handler error returns 500 while the response
     // can still carry one, instead of crashing the process. Once the status is
-    // committed the responder writes nothing rather than appending this body.
+    // committed the responder writes nothing rather than appending this body. A
+    // failure raised while writing a response that had sent nothing arrives here as
+    // well, escalated by the responder, so that class is answered with the same 500
+    // instead of leaving the client with nothing on the wire.
+    writeFailureEscalates = false;          // this write is the last attempt made
     console.error(`Unhandled request error: ${describeError(err)}`);
     respond(500, { 'Content-Type': 'text/plain' }, 'Internal Server Error\n');
+  } finally {
+    // RC1: the handler's synchronous body has returned, so there is no catch left
+    // beneath an asynchronous stream listener for a write failure to escalate to.
+    writeFailureEscalates = false;
   }
 });
 
 // RC5: apply the three explicit timeouts, replacing Node's version-dependent
 // defaults, and assign them before listen() so the policy is in force before the
-// first connection is accepted. They are deadlines rather than exact wall-clock
-// ceilings: Node reaps an expired connection at the next of its periodic scans,
-// so the effective header and request ceilings are the configured value plus up
-// to one scan interval, and a runtime may hold an idle kept-alive socket a little
-// past keepAliveTimeout. Tightening that granularity, and bounding how many
-// sockets a peer may hold or how many exchanges it may run through one, are
-// outside the specified change: a socket-count ceiling is a deployment control,
-// and the default bind is loopback-only.
+// first connection is accepted. The header and request deadlines are enforced on
+// the scan cadence set at construction above, so each is a ceiling of its
+// configured value plus at most one interval — 25 s and 35 s — rather than an
+// exact wall-clock instant, and a runtime may hold an idle kept-alive socket a
+// little past keepAliveTimeout, which it enforces per socket instead. Bounding
+// how many sockets a peer may hold, or how many exchanges it may run through one,
+// stays outside the specified change: a socket-count ceiling is a deployment
+// control, and the default bind is loopback-only.
 server.requestTimeout = REQUEST_TIMEOUT_MS;
 server.headersTimeout = HEADERS_TIMEOUT_MS;
 server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
