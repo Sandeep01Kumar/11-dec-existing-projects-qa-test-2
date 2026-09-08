@@ -1,171 +1,227 @@
-// server.js — hardened HTTP server for hao-backprop-test.
-// Built on the Node.js built-in `http` module only (zero third-party dependencies).
-// Preserves the original "Hello, World!" behavior on GET / while adding error
-// handling, input validation, graceful shutdown, resource cleanup, and robust
-// HTTP request processing. Compatible with Node.js >= 18 LTS (installed: v22).
+// Zero-dependency HTTP server built on Node's core `http` module.
+// Serves the GET / greeting contract — 200 `text/plain` with the body
+// `Hello, World!\n` — behind request validation, standardized error responses,
+// explicit request-processing ceilings, graceful shutdown and connection cleanup.
+// Supported runtimes are the approved Node LTS lines the startup guard below
+// enforces; no behavior of this file is claimed on a release outside that range,
+// including behavior that Node does not document.
 const http = require('http');
 
-// RC5: env-overridable config, preserving original defaults (127.0.0.1:3000).
-// RC5: `HOST` and `PORT` are the only untrusted input read at startup, so each is
-// resolved and validated here — before `createServer()` and `listen()` — and a
-// malformed value fails fast with a named configuration error. Truthiness alone
-// cannot do this job: it turns a present-but-empty, whitespace-only or
-// non-numeric `PORT` into the default, so a supplied value silently loses
-// precedence, while a fractional, negative, hexadecimal or out-of-range value
-// stays truthy and reaches `listen()`, where Node core throws
-// `ERR_SOCKET_BAD_PORT` synchronously at module scope — before any server or
-// process handler exists to report it.
-const DEFAULT_HOST = '127.0.0.1';
-const DEFAULT_PORT = 3000;
-const MIN_PORT = 1;
-const MAX_PORT = 65535;
-const MAX_HOSTNAME_LENGTH = 253;
-const IPV6_GROUP_COUNT = 8;
-const MAX_ECHOED_VALUE_LENGTH = 64;
+// RC5: the Node release is the only dependency a zero-dependency server has, and
+// the timeout, parser and shutdown semantics this file configures are decided by
+// that release, so the supported range is enforced here rather than asserted in a
+// comment: `package.json` declares no `engines` field and is out of scope for this
+// change, which leaves this the only place an unapproved runtime can be refused.
+// Each entry is an LTS line still supported upstream, floored at or above the
+// release that promoted that line to LTS. Reconciled with the Node.js release
+// schedule and security-release history on 2026-09-08: 18.x and 20.x ended
+// support on 2025-04-30 and 2026-04-30, and the newest security releases were
+// 22.23.2 and 24.18.1, published 2026-07-29 and carrying CVE-2026-56846 to
+// CVE-2026-56848, CVE-2026-56850, CVE-2026-58039 to CVE-2026-58045 and
+// CVE-2026-48934, per
+// https://nodejs.org/en/blog/vulnerability/july-2026-security-releases.
+// This table gates the release line; running at or above the newest security
+// release within that line is a deployment control, not a startup gate.
+// Revisit the table whenever a listed line ends support or a new line enters LTS.
+const APPROVED_NODE_LINES = [
+  { major: 22, minimum: [22, 12, 0], supportEnds: '2027-04-30' },
+  { major: 24, minimum: [24, 11, 0], supportEnds: '2028-04-30' },
+];
 
-// RFC 1123 host name: dot-separated labels of 1-63 alphanumerics and hyphens,
-// never leading or trailing a label, with an optional root dot.
-const HOSTNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$/;
-
-// Every control character is rejected in a host value and escaped in any echoed
-// value: C0 (`\u0000`-`\u001f`), DEL, the C1 block (`\u0080`-`\u009f`, which
-// includes NEL and the CSI terminal introducer) and the Unicode line and
-// paragraph separators. All of them can alter log or terminal rendering.
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
-const CONTROL_CHARACTER_PATTERN_GLOBAL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
-
-// RC1: a bad configuration value is unrecoverable and is detected before any
-// listener exists, so it is reported on stderr and the process exits non-zero
-// instead of throwing an uncaught stack trace. This never returns to its caller.
-function exitWithConfigurationError(message) {
-  console.error(`Invalid configuration: ${message}`);
+// RC5: fail closed on a runtime outside that range, before the server object, the
+// request handler and the signal handlers exist, so an unapproved release stops at
+// startup instead of serving traffic under semantics it was never validated for.
+// All three ways out of the range are refused: a line past end of life receives no
+// further security fixes, an odd-numbered line never enters LTS, and a line newer
+// than the table has not been validated against this file. Only a bare
+// `major.minor.patch` version is accepted, so a nightly, release-candidate or
+// otherwise unparsable build is refused rather than assumed current, and nothing
+// but the parsed numbers reaches the diagnostic.
+function requireApprovedRuntime(version) {
+  const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version));
+  const running = parsed ? parsed.slice(1, 4).map(Number) : null;
+  const line = running ? APPROVED_NODE_LINES.find((entry) => entry.major === running[0]) : undefined;
+  // The major already matches the entry, so the floor is decided by minor, then patch.
+  if (line && (running[1] > line.minimum[1]
+    || (running[1] === line.minimum[1] && running[2] >= line.minimum[2]))) {
+    return;
+  }
+  const approved = APPROVED_NODE_LINES
+    .map((entry) => `${entry.major}.x >= ${entry.minimum.join('.')} (supported through ${entry.supportEnds})`)
+    .join(', ');
+  const reported = running ? running.join('.') : 'with an unrecognized version';
+  console.error(`Unapproved Node.js runtime ${reported}: this server runs only on ${approved}.`);
   process.exit(1);
 }
 
-// Environment values are untrusted text: echo them quoted, escaped and
-// length-capped so a malformed value cannot inject control characters into logs.
-function describeValue(value) {
-  const text = String(value);
-  const clipped = text.length > MAX_ECHOED_VALUE_LENGTH
-    ? `${text.slice(0, MAX_ECHOED_VALUE_LENGTH)}...`
-    : text;
-  // JSON quoting handles the surrounding quotes, backslashes and C0 controls;
-  // every control character it leaves verbatim — DEL, the C1 block and the
-  // line/paragraph separators — is then rendered as a visible `\uXXXX` escape,
-  // so no echoed value can emit an invisible control into the log.
-  return JSON.stringify(clipped).replace(CONTROL_CHARACTER_PATTERN_GLOBAL, (character) =>
-    `\\u${character.codePointAt(0).toString(16).padStart(4, '0')}`);
-}
+requireApprovedRuntime(process.versions.node);
 
-// Dotted-quad IPv4 literal. Leading zeros are rejected because a zero-padded
-// octet is ambiguous (decimal here, octal to some resolvers).
-function isIpv4Address(value) {
-  const octets = value.split('.');
-  return octets.length === 4 && octets.every((octet) =>
-    /^(?:0|[1-9][0-9]{0,2})$/.test(octet) && Number(octet) <= 255);
-}
-
-// IPv6 literal, allowing one `::` compression marker, an optional `%zone`
-// suffix, and a trailing IPv4 form (`::ffff:127.0.0.1`) that occupies two of
-// the eight 16-bit groups.
-function isIpv6Address(value) {
-  const [address, zoneId, ...extraZones] = value.split('%');
-  if (extraZones.length > 0) return false;
-  if (zoneId !== undefined && !/^[0-9A-Za-z._~-]+$/.test(zoneId)) return false;
-  const halves = address.split('::');
-  if (halves.length > 2) return false;
-  const compressed = halves.length === 2;
-  const groups = (halves[0] === '' ? [] : halves[0].split(':'))
-    .concat(compressed && halves[1] !== '' ? halves[1].split(':') : []);
-  let groupCount = groups.length;
-  if (groups.length > 0 && groups[groups.length - 1].includes('.')) {
-    if (!isIpv4Address(groups.pop())) return false;
-    groupCount += 1;
-  }
-  if (!groups.every((group) => /^[0-9A-Fa-f]{1,4}$/.test(group))) return false;
-  return compressed ? groupCount < IPV6_GROUP_COUNT : groupCount === IPV6_GROUP_COUNT;
-}
-
-// RC5: `HOST` resolution — the configurable-bind root cause; RC3 covers inbound
-// request validation, in the handler below. An absent key keeps the original
-// default; a present value is trimmed and must be a syntactically valid IPv4
-// address, IPv6 literal (bare or bracketed) or host name. Only this normalized,
-// validated value is used by `listen()` and by the diagnostics below.
-function resolveHost(rawHost) {
-  if (rawHost === undefined) return DEFAULT_HOST;
-  const value = String(rawHost).trim();
-  if (value === '') {
-    exitWithConfigurationError(`HOST is set but empty; unset it to use the default ${DEFAULT_HOST}, or supply a host name or IP address.`);
-  }
-  if (CONTROL_CHARACTER_PATTERN.test(value)) {
-    exitWithConfigurationError(`HOST ${describeValue(value)} contains control characters; supply a plain host name or IP address.`);
-  }
-  // Brackets are valid only around an IPv6 literal, so they are stripped to the
-  // bare address `listen()` expects and any other bracketed text is rejected
-  // rather than silently unwrapped into a different host.
-  const bracketed = value.length > 1 && value.startsWith('[') && value.endsWith(']');
-  const candidate = bracketed ? value.slice(1, -1) : value;
-  if (bracketed && !isIpv6Address(candidate)) {
-    exitWithConfigurationError(`HOST ${describeValue(value)} is bracketed, which is valid only for an IPv6 literal.`);
-  }
-  if (isIpv4Address(candidate) || isIpv6Address(candidate)) return candidate;
-  // An all-numeric dotted value is a malformed IPv4 literal rather than a host
-  // name, so reject it here instead of deferring to a lookup that cannot resolve.
-  if (/^[0-9.]+$/.test(candidate)) {
-    exitWithConfigurationError(`HOST ${describeValue(value)} is a malformed IPv4 address.`);
-  }
-  if (candidate.length > MAX_HOSTNAME_LENGTH || !HOSTNAME_PATTERN.test(candidate)) {
-    exitWithConfigurationError(`HOST ${describeValue(value)} is not a valid host name or IP address.`);
-  }
-  return candidate;
-}
-
-// RC5: `PORT` resolution — the same configurable-bind root cause. An absent key
-// keeps the original default; a present value must be a plain decimal integer
-// inside the listenable range. The digits-only test is the explicit
-// textual-form policy `Number()` lacks: it
-// rejects hexadecimal (`0x1f` would otherwise become 31), scientific,
-// fractional, signed and `Infinity` spellings instead of silently converting
-// them or collapsing them into the default.
-function resolvePort(rawPort) {
-  if (rawPort === undefined) return DEFAULT_PORT;
-  const value = String(rawPort).trim();
-  if (value === '') {
-    exitWithConfigurationError(`PORT is set but empty; unset it to use the default ${DEFAULT_PORT}, or supply an integer between ${MIN_PORT} and ${MAX_PORT}.`);
-  }
-  if (!/^[0-9]+$/.test(value)) {
-    exitWithConfigurationError(`PORT ${describeValue(value)} is not a decimal integer between ${MIN_PORT} and ${MAX_PORT}.`);
-  }
-  const parsed = Number(value);
-  // Port 0 is rejected deliberately: it asks the OS for an ephemeral port, but
-  // the startup log reports the configured port, so the advertised address would
-  // not be the bound one. Callers must name a fixed port.
-  if (parsed === 0) {
-    exitWithConfigurationError(`PORT 0 requests an OS-assigned ephemeral port, which is not supported; supply a fixed port between ${MIN_PORT} and ${MAX_PORT}.`);
-  }
-  if (!Number.isInteger(parsed) || parsed < MIN_PORT || parsed > MAX_PORT) {
-    exitWithConfigurationError(`PORT ${describeValue(value)} is outside the supported range ${MIN_PORT}-${MAX_PORT}.`);
-  }
-  return parsed;
-}
-
-const hostname = resolveHost(process.env.HOST);
-const port = resolvePort(process.env.PORT);
+// RC5: env-overridable config, preserving original defaults (127.0.0.1:3000).
+// An unset or empty `HOST`, and an unset, empty or non-numeric `PORT`, each keep
+// that default, so the bind is configurable without ever losing a valid address.
+const hostname = process.env.HOST || '127.0.0.1';
+const port = Number(process.env.PORT) || 3000;
 
 // RC5: explicit timeouts (ms) for deterministic behavior across Node versions.
 const REQUEST_TIMEOUT_MS = 30000;
 const HEADERS_TIMEOUT_MS = 20000;
 const KEEP_ALIVE_TIMEOUT_MS = 5000;
-// RC4/RC5: general per-socket inactivity ceiling. Node leaves `server.timeout`
-// at 0 — no inactivity guard at all — unless it is assigned, and re-applies
-// `server.timeout || 0` to a socket after each keep-alive idle period. It is
-// deliberately the outermost ceiling (5s keep-alive idle < 20s headers < 30s
-// whole request < 60s socket inactivity) so the HTTP-level deadlines, which can
-// answer with a status code, always act first and this one only reaps sockets
-// they do not cover, such as connections making no parser progress. No
-// `'timeout'` listener is registered, so Node destroys the socket when it fires.
-const SOCKET_TIMEOUT_MS = 60000;
 const SHUTDOWN_TIMEOUT_MS = 10000;
+
+// RC5: granularity of the header and request deadlines. Node enforces them from
+// an interval scan over the tracked connections rather than a per-socket timer,
+// so an expired connection is only reaped at the next scan and the effective
+// ceiling is the configured deadline plus up to one whole interval. The 30-second
+// default interval therefore lets a connection that never completes its headers
+// outlive the 20-second ceiling by tens of seconds; a one-second interval keeps
+// both effective ceilings within a second of their configured values, at the cost
+// of one unref'd tick per second across at most MAX_CONNECTIONS entries. A
+// runtime without the setting keeps its own scan granularity.
+const CONNECTIONS_CHECKING_INTERVAL_MS = 1000;
+
+// RC5: buffer added to the idle keep-alive deadline. Supported runtimes arm the
+// idle socket timer three different ways: from `keepAliveTimeout` alone; from
+// `keepAliveTimeout` plus a buffer fixed at one second in the runtime itself; or
+// from `keepAliveTimeout` plus the buffer this server supplies, which the runtime
+// otherwise defaults to one second. Only the third reads the value below, so it
+// is assigned only where the runtime already defines the property rather than
+// left as an inert one that would misstate the ceiling. Pinning it to zero makes
+// the `timeout` the response's own `Keep-Alive` header advertises the real idle
+// ceiling there, matching the runtimes that add no buffer; the ones with a fixed
+// internal buffer keep their extra second and hold an idle socket that much
+// longer. Closing at the advertised deadline is safe here because GET and HEAD
+// are idempotent: a client that races the deadline can retry on a new connection.
+const KEEP_ALIVE_TIMEOUT_BUFFER_MS = 0;
+
+// RC4/RC5: finite active-resource ceilings. The deadlines above bound how long
+// one socket may stay idle or incomplete, but not how many sockets a peer may
+// hold or how many exchanges it may run through one of them: Node leaves
+// `maxConnections` unset and `maxRequestsPerSocket` at 0, both unlimited, so a
+// peer answering inside every deadline can pin descriptors, parser state and
+// event-loop time without ever timing out. MAX_CONNECTIONS caps accepted sockets
+// far enough below a 1024-descriptor soft limit to leave room for stdio and the
+// listening socket; Node closes anything beyond it at accept time, before request
+// state exists and without a log line per rejected connection.
+// MAX_REQUESTS_PER_SOCKET recycles a kept-alive HTTP/1.1 connection after a
+// bounded number of exchanges: the last permitted response carries
+// `Connection: close` and a further request on that socket is answered 503, so no
+// single connection accumulates state indefinitely. Node also advertises the
+// ceiling to the client as the `max` parameter of the `Keep-Alive` response
+// header, so a well-behaved client reconnects before reaching it.
+const MAX_CONNECTIONS = 512;
+const MAX_REQUESTS_PER_SOCKET = 1000;
+
+// RC1: operator diagnostics are themselves a security surface, so no thrown value
+// or rejection reason is ever handed to `console.*`. Console formatting would
+// render that value's message, stack, file paths, `cause` chain and every
+// enumerable property — any of which can carry a credential, a token or personal
+// data — and it consults a custom inspection hook found on the value, which runs
+// caller-supplied code inside handlers that include the fatal ones, where it can
+// throw again or consume unbounded time. Only the three allowlisted fields below
+// are read, and a field's value is emitted only when it already has the short
+// plain-identifier shape that Node's own `name`, `code` and `syscall` carry.
+// Every other property is excluded, and so is any value of those three that is
+// not such a token, so no free-form content from the value reaches the log.
+const MAX_ERROR_TOKEN_LENGTH = 48;
+// RC1: a plain identifier token: no whitespace, no punctuation beyond `_`, `.`
+// and `-`, and therefore no control character, quote or newline that could forge
+// a second log record. Anything else is replaced by a fixed marker, not escaped.
+const ERROR_TOKEN_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+const ALLOWLISTED_ERROR_FIELDS = ['name', 'code', 'syscall'];
+
+// RC1: reads one allowlisted field: the token itself when it is a plain bounded
+// identifier, a fixed marker when the field is present in some other shape, and
+// `undefined` when it is absent. The read is guarded because on a hostile value
+// the field can be a getter that throws or returns anything at all, and a log
+// path must not be the thing that raises an error.
+function readErrorToken(value, field) {
+  try {
+    const token = value[field];
+    if (token === undefined || token === null) return undefined;
+    if (typeof token !== 'string') return 'non-string';
+    if (token.length > MAX_ERROR_TOKEN_LENGTH || !ERROR_TOKEN_PATTERN.test(token)) return 'unloggable';
+    return token;
+  } catch {
+    return 'unreadable';
+  }
+}
+
+// RC1: the shared log-safe rendering of any thrown value or rejection reason — a
+// bounded summary built only from the three allowlisted token fields, carrying no
+// message, no stack, no `cause` and no free-form property content. A primitive is
+// reduced to its type alone, because the value itself is exactly what may be
+// sensitive.
+function describeError(value) {
+  if (value === null) return 'type=null';
+  if (typeof value !== 'object') return `type=${typeof value}`;
+  const fields = [];
+  for (const field of ALLOWLISTED_ERROR_FIELDS) {
+    const token = readErrorToken(value, field);
+    if (token !== undefined) fields.push(`${field}=${token}`);
+  }
+  return fields.length > 0 ? fields.join(' ') : 'type=object';
+}
+
+// RC1/RC4: both fault kinds below are remotely triggerable and cost an
+// unauthenticated peer almost nothing — a reset connection, a socket dropped
+// mid-exchange. One stderr record per event would let that peer spend the
+// server's formatting time, stderr buffer memory, log storage and event-loop
+// budget at will, so these faults are accounted for in fixed memory instead: the
+// kind set is closed and pre-created so no traffic can grow it, the counters
+// saturate, each kind announces itself once, and the running totals are reported
+// at most once per interval and once more at shutdown. The log therefore records
+// aggregate state changes rather than individual client faults.
+const CLIENT_FAULT_REPORT_INTERVAL_MS = 60000;
+const CLIENT_FAULT_KINDS = [
+  'request-stream',              // socket fault while a request was being read
+  'response-stream',             // socket fault while a response was being written
+];
+const clientFaultTotals = Object.create(null);
+const clientFaultAnnounced = Object.create(null);
+for (const kind of CLIENT_FAULT_KINDS) {
+  clientFaultTotals[kind] = 0;
+  clientFaultAnnounced[kind] = false;
+}
+let unreportedClientFaults = 0;
+let lastClientFaultReport = Date.now();
+
+// RC1/RC4: emits the running totals — every field a fixed kind name and an
+// integer, so the line's length and cardinality are bounded — but only when
+// something has happened since the last report, and only once per interval
+// unless `force` asks for the final tally. Rate limiting is a timestamp
+// comparison rather than a timer, so no handle is created that could hold the
+// event loop open or fire during a shutdown.
+function reportClientFaults(force) {
+  if (unreportedClientFaults === 0) return;
+  const now = Date.now();
+  if (!force && now - lastClientFaultReport < CLIENT_FAULT_REPORT_INTERVAL_MS) return;
+  lastClientFaultReport = now;
+  unreportedClientFaults = 0;
+  const totals = CLIENT_FAULT_KINDS
+    .filter((kind) => clientFaultTotals[kind] > 0)
+    .map((kind) => `${kind}=${clientFaultTotals[kind]}`)
+    .join(' ');
+  console.error(`Client fault totals: ${totals}`);
+}
+
+// RC1/RC4: records one occurrence of a known fault kind. An unknown kind is
+// ignored rather than added, so the key set stays exactly as declared above.
+// `detail` is an already-validated token — a Node error code, or a code and the
+// status it was answered with — and appears only in that kind's single
+// announcement. Whatever a peer provokes therefore costs at most one
+// detail-bearing record per kind for the process lifetime, plus the
+// interval-limited totals above and the final tally at shutdown.
+function recordClientFault(kind, detail) {
+  if (clientFaultTotals[kind] === undefined) return;
+  if (clientFaultTotals[kind] < Number.MAX_SAFE_INTEGER) clientFaultTotals[kind] += 1;
+  unreportedClientFaults += 1;
+  if (!clientFaultAnnounced[kind]) {
+    clientFaultAnnounced[kind] = true;
+    const qualifier = detail === undefined ? '' : ` (${detail})`;
+    console.error(`Client fault ${kind}${qualifier}: counted from here on, not logged per event.`);
+  }
+  reportClientFaults(false);
+}
 
 const server = http.createServer((req, res) => {
   // RC1: every response this handler produces — success or failure — is written by
@@ -180,7 +236,7 @@ const server = http.createServer((req, res) => {
     if (responded) return;                  // first writer wins; later paths are no-ops
     responded = true;
     if (res.destroyed || res.writableEnded) {
-      return;                               // nothing can be delivered: write nothing
+      return;
     }
     if (res.headersSent) {
       // The status line is already on the wire, so this status can no longer be
@@ -197,50 +253,42 @@ const server = http.createServer((req, res) => {
       res.end(body);                        // body is omitted for HEAD: headers only
     } catch (writeErr) {
       // The responder must never throw or emit a secondary response error: if the
-      // socket failed mid-write, there is nothing left to send.
-      console.error('Failed to write response:', writeErr);
+      // socket failed mid-write, there is nothing left to send. The failure is
+      // reported by its allowlisted fields alone, never by handing the thrown
+      // value to the log.
+      console.error(`Failed to write response: ${describeError(writeErr)}`);
       if (!res.destroyed) res.destroy();
     }
   };
 
-  // RC1: per-request stream error handling (never crash the process on socket
-  // errors). The 400 is delivered only while the response can still carry it; once
-  // a response has been issued the listener writes nothing at all, and the one-shot
-  // responder — not a single-fire listener — is what keeps the 400 terminal, so a
-  // repeat stream error stays handled here instead of escalating to an unhandled
-  // 'error' event. The whole error value is logged, because reading only
-  // err.message blanks the line for an Error without a message, prints undefined
-  // for a non-Error value, and throws — losing the diagnostic entirely — when
-  // message is a throwing getter.
+  // RC1: handling the request stream's errors here is what keeps a socket fault
+  // from being emitted as an unhandled 'error' event on `req`. The 400 is
+  // attempted only while the response can still carry it, and the one-shot
+  // responder — not a single-fire listener — is what keeps it terminal, so a
+  // repeated stream error on the same request stays handled. The fault is counted
+  // rather than logged per event, because a peer can cause it cheaply and at will.
   req.on('error', (err) => {
-    console.error('Request stream error:', err);
+    recordClientFault('request-stream', readErrorToken(err, 'code'));
     respond(400, { 'Content-Type': 'text/plain' }, 'Bad Request\n');
   });
   // RC1: a failed response stream can no longer carry any status, so this listener
-  // reports the failure and writes nothing, and marks the response spent so no
-  // later path attempts a write on it either.
+  // records the fault and writes nothing, and marks the response spent so no later
+  // path attempts a write on it either.
   res.on('error', (err) => {
-    console.error('Response stream error:', err);
+    recordClientFault('response-stream', readErrorToken(err, 'code'));
     responded = true;
   });
 
   try {
-    // RC3: input validation — only GET/HEAD are supported; reject others with 405.
+    // RC3: enforce the public method contract — GET and HEAD are the only methods
+    // this endpoint serves, and a rejection advertises them in `Allow` so a client
+    // can correct the request rather than guess at what is supported.
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       respond(405, { 'Allow': 'GET, HEAD', 'Content-Type': 'text/plain' }, 'Method Not Allowed\n');
       return;
     }
-    // RC3/RC5: the binding path contract is method-only dispatch, deliberately
-    // path-independent. req.url is not a dispatch input and there is no 404 branch,
-    // so GET/HEAD on any request target receive the same greeting. AAP §0.5.1's
-    // validated target implementation, §0.5.2's change instructions and §0.6.1's
-    // exhaustive change list all map RC3 to this method allow-list alone, §0.6.2
-    // and §0.8 forbid adding routing or any behavior beyond the five named concern
-    // areas, and this file's processed schema states the same rule explicitly. The
-    // §0.2 RC3/RC5 diagnosis also mentions path/URL and 404 gaps; the specification
-    // that supersedes it does not adopt them, so path routing is out of contract
-    // here rather than merely unimplemented.
-    //
+    // RC3/RC5: dispatch is method-only by contract; the request target is not a
+    // dispatch input, so GET and HEAD answer every path with the same greeting.
     // Preserve original behavior: 200 text/plain "Hello, World!".
     if (req.method === 'HEAD') {
       respond(200, { 'Content-Type': 'text/plain' });
@@ -252,245 +300,189 @@ const server = http.createServer((req, res) => {
     // can still carry one, instead of crashing the process. After the status is
     // committed, or once the response has ended or been destroyed, the responder
     // writes nothing rather than appending this body under the previous status.
-    console.error('Unhandled request error:', err);
+    console.error(`Unhandled request error: ${describeError(err)}`);
     respond(500, { 'Content-Type': 'text/plain' }, 'Internal Server Error\n');
   }
 });
 
-// RC5: apply explicit timeouts.
+// RC4/RC5: replace Node's version-dependent defaults with the policy above, and
+// do it here so the whole policy is in force before listen() accepts anything.
+// Node reads the scan interval when the server starts listening, the keep-alive
+// buffer when a response finishes and the two ceilings on each accepted socket
+// and request, so assigning them to the server is what puts them into effect.
+// The resulting effective ceilings are one second beyond each scanned deadline:
+// no more than 21s to complete request headers and 31s to complete a request,
+// and an idle kept-alive socket held for the advertised 5s, or a second longer
+// on a runtime whose own fixed keep-alive buffer this server cannot override.
 server.requestTimeout = REQUEST_TIMEOUT_MS;
 server.headersTimeout = HEADERS_TIMEOUT_MS;
 server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
-server.timeout = SOCKET_TIMEOUT_MS;
-
-// RC1/RC2/RC4: exit-status intent shared by every terminal path. A normal signal
-// finishes with EXIT_SUCCESS; every fatal trigger (uncaught exception, unhandled
-// rejection, an error on a live server, a close failure, the forced timeout)
-// finishes with EXIT_FAILURE, so a supervisor can tell a crash from a clean stop.
-const EXIT_SUCCESS = 0;
-const EXIT_FAILURE = 1;
-
-// RC1: upper bound on how long a hard stop waits for already-queued diagnostics
-// to reach a redirected or piped stdout/stderr before terminating regardless.
-const FLUSH_TIMEOUT_MS = 1000;
-
-let exitIntent = EXIT_SUCCESS;
-
-// RC1: escalate the intended exit status monotonically — failure never downgrades
-// back to success — and publish it through `process.exitCode` so the status is
-// already correct if the drained event loop ends the process on its own.
-function recordExitIntent(code) {
-  if (code > exitIntent) exitIntent = code;
-  process.exitCode = exitIntent;
-  return exitIntent;
+server.connectionsCheckingInterval = CONNECTIONS_CHECKING_INTERVAL_MS;
+server.maxConnections = MAX_CONNECTIONS;
+server.maxRequestsPerSocket = MAX_REQUESTS_PER_SOCKET;
+// RC5: the keep-alive buffer is configurable only on a runtime that defines the
+// property itself, so it is read before it is written: assigning it anywhere else
+// would add an inert property that claims a ceiling the runtime does not apply.
+if (typeof server.keepAliveTimeoutBuffer === 'number') {
+  server.keepAliveTimeoutBuffer = KEEP_ALIVE_TIMEOUT_BUFFER_MS;
 }
 
-// RC1/RC4: `process.exit()` calls `reallyExit()` synchronously, so bytes still
-// queued on an asynchronous stdout/stderr (a pipe on POSIX, a TTY on Windows)
-// are discarded and required lifecycle diagnostics go missing. Ordinary terminal
-// paths therefore only record the status and let the drained event loop end the
-// process; this is the single hard stop, reserved for the forced-shutdown timer,
-// and it waits for queued writes to complete first — bounded by FLUSH_TIMEOUT_MS
-// so a stalled reader can never keep the process alive.
-function exitAfterFlush(code) {
-  recordExitIntent(code);
-  let exited = false;
-  let pending = 0;
-  const hardExit = () => {
-    if (exited) return;                     // exactly one hard stop, whichever path arrives first
-    exited = true;
-    process.exit(exitIntent);
-  };
-  for (const stream of [process.stdout, process.stderr]) {
-    // A synchronous stream has already written everything; only an async one buffers.
-    if (stream && stream.writable && stream.writableLength > 0) {
-      pending += 1;
-      stream.write('', () => { pending -= 1; if (pending === 0) hardExit(); });
+// RC2/RC4: the ordering is the contract. The pending exit status is escalated and
+// the hard deadline armed first, which is what makes every stage after them
+// expendable; then admission stops, idle sockets go immediately, and in-flight
+// requests are left to drain. The trade-off is deliberate: draining is bounded
+// rather than unlimited, so a request that will not finish costs at most
+// SHUTDOWN_TIMEOUT_MS and is then aborted with failure status instead of holding
+// the process open.
+let shuttingDown = false;
+let shutdownExitCode = 0;
+
+// RC1/RC4: runs one stage of the terminal path with its synchronous failure
+// contained, so a failing stage can neither abort the stages after it nor escape
+// into the fatal handlers, where it would re-enter shutdown() only to be discarded
+// by the duplicate guard. The failure escalates the exit status and is named by
+// stage alone: passing the thrown value to `console` would re-admit the hazard
+// being contained, since formatting an arbitrary value can invoke a custom
+// inspection hook that throws in turn.
+function runCleanupStage(stage, run) {
+  try {
+    run();
+  } catch {
+    if (shutdownExitCode < 1) shutdownExitCode = 1;
+    try {
+      console.error(`Shutdown stage failed: ${stage}.`);
+    } catch {
+      // The report failed too; the escalated status is the only signal left.
     }
   }
-  if (pending === 0) { hardExit(); return; }
-  setTimeout(hardExit, FLUSH_TIMEOUT_MS).unref();
 }
 
-// RC2/RC4: graceful shutdown + resource cleanup.
-let shuttingDown = false;
-function shutdown(signal, intendedExitCode = EXIT_FAILURE) {
-  // RC1: record the outcome BEFORE the duplicate-shutdown guard, so a fatal
-  // trigger arriving during an in-progress shutdown still upgrades the pending
-  // result to failure instead of being swallowed by the guard. A caller that
-  // names no status is treated as fatal.
-  recordExitIntent(intendedExitCode);
+// RC1/RC4: the hard stop is a single retained deadline, armed before any fallible
+// stage runs and never cleared. Arming it first is what makes those stages
+// expendable: whatever one of them throws, and however many later fatal events the
+// duplicate guard discards, this timer remains the terminal path. It is unref'd so
+// it cannot itself hold open a process whose draining finished early.
+let forcedStopTimer = null;
+function armForcedStop() {
+  if (forcedStopTimer !== null) return;
+  try {
+    forcedStopTimer = setTimeout(forceStop, SHUTDOWN_TIMEOUT_MS);
+    forcedStopTimer.unref();
+  } catch {
+    // Nothing would bound the cleanup that follows an unschedulable deadline, so
+    // stop now with failure status rather than enter it unbounded.
+    process.exit(1);
+  }
+}
+
+// RC1/RC4: the forced stop cannot be defeated from inside itself — each stage is
+// contained, and `finally` carries the sequence through to the exit so the
+// non-bypassable process.exit(1) runs whatever the stages did.
+function forceStop() {
+  try {
+    runCleanupStage('forced-stop report', () => {
+      console.error('Forced shutdown after timeout.');
+    });
+    runCleanupStage('active-connection release', () => {
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    });
+  } finally {
+    process.exit(1);
+  }
+}
+
+// RC2/RC4: completion of the drain, run as a contained stage because Node invokes
+// it: a throw here would surface as an uncaughtException and re-enter shutdown()
+// only to be discarded by the duplicate guard.
+function onServerClosed(err) {
+  runCleanupStage('close completion', () => {
+    if (err) { console.error(`Error during server close: ${describeError(err)}`); process.exit(1); }
+    console.log('Server closed. Exiting.');
+    process.exit(shutdownExitCode);         // 0 for a normal signal, 1 for any fatal trigger
+  });
+}
+
+function shutdown(signal, exitCode = 1) {
+  // RC1: escalate the pending status before the duplicate-shutdown guard, so a
+  // fatal trigger that arrives while a signal shutdown is still draining exits
+  // non-zero instead of being reported as a clean stop. Escalation is one-way
+  // and is the only work a repeat call does, so the guard below still keeps the
+  // close sequence, its logging and its cleanup single. A caller that names no
+  // status is treated as fatal.
+  if (exitCode > shutdownExitCode) shutdownExitCode = exitCode;
+  // RC1/RC4: arm the hard deadline before the guard and before every fallible
+  // stage below, so it is established by the first trigger to reach this line and
+  // merely confirmed by any later one. No failure beneath it can leave the process
+  // running without a hard stop.
+  armForcedStop();
   if (shuttingDown) return;                 // guard against double invocation
   shuttingDown = true;
-  console.log(`${signal} received: closing server gracefully...`);
-  server.close((err) => {                   // stop accepting new connections, drain in-flight
-    if (err) { console.error('Error during server close:', err); recordExitIntent(EXIT_FAILURE); return; }
-    console.log('Server closed. Exiting.');
-    process.exitCode = exitIntent;          // 0 for a normal signal, 1 for any fatal trigger
-  });
-  if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections(); // Node >= 18.2
-  setTimeout(() => {                         // force exit if draining exceeds the timeout
-    console.error('Forced shutdown after timeout.');
-    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
-    exitAfterFlush(EXIT_FAILURE);
-  }, SHUTDOWN_TIMEOUT_MS).unref();
+  try {
+    runCleanupStage('shutdown announcement', () => {
+      console.log(`${signal} received: closing server gracefully...`);
+    });
+    runCleanupStage('client-fault tally', () => {
+      reportClientFaults(true);             // final tally, so counted faults are not lost at exit
+    });
+    runCleanupStage('server close', () => {
+      server.close(onServerClosed);         // stop accepting new connections, drain in-flight
+    });
+  } finally {
+    // Idle keep-alive sockets carry no request and would otherwise make the drain
+    // wait out their keep-alive ceiling, so they are released even when an earlier
+    // stage failed. Guarded because the API exists only from Node >= 18.2.
+    runCleanupStage('idle-connection release', () => {
+      if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+    });
+  }
 }
 
-// RC1/RC2: register the signal and fatal-event handlers BEFORE `server.listen()`.
-// Node validates the bind arguments synchronously inside listen(), so an invalid
-// environment-derived port throws there — the safety nets must already exist.
-process.on('SIGTERM', () => shutdown('SIGTERM', EXIT_SUCCESS));
-process.on('SIGINT', () => shutdown('SIGINT', EXIT_SUCCESS));
+// RC1/RC2: the signal and fatal-event handlers are registered before
+// `server.listen()`, so a signal or a fatal error arriving while the bind is still
+// in flight is already carried by them rather than by Node's default disposition,
+// which would end the process before any controlled drain and without the
+// lifecycle diagnostics and exit-status policy above.
+process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+process.on('SIGINT', () => shutdown('SIGINT', 0));
 
 // RC1: process-level safety nets for otherwise-uncaught errors. Both drain the
 // server like a signal does, but terminate with failure status.
-process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); shutdown('uncaughtException', EXIT_FAILURE); });
-process.on('unhandledRejection', (reason) => { console.error('Unhandled promise rejection:', reason); shutdown('unhandledRejection', EXIT_FAILURE); });
+process.on('uncaughtException', (err) => { console.error(`Uncaught exception: ${describeError(err)}`); shutdown('uncaughtException', 1); });
+process.on('unhandledRejection', (reason) => { console.error(`Unhandled promise rejection: ${describeError(reason)}`); shutdown('unhandledRejection', 1); });
 
 // RC1: handle listen errors (EADDRINUSE/EACCES) cleanly instead of an unhandled 'error'.
 server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') console.error(`Port ${port} is already in use on ${hostname}.`);
-  else if (err.code === 'EACCES') console.error(`Insufficient privileges to bind ${hostname}:${port}.`);
-  else console.error('Server error:', err);
+  // RC1: the code that selects the message is read through the same guarded
+  // accessor as the message itself, so nothing in this handler — the one that
+  // reports a failure of the server object — can raise a second error of its own.
+  const code = readErrorToken(err, 'code');
+  if (code === 'EADDRINUSE') console.error(`Port ${port} is already in use on ${hostname}.`);
+  else if (code === 'EACCES') console.error(`Insufficient privileges to bind ${hostname}:${port}.`);
+  else console.error(`Server error: ${describeError(err)}`);
   // RC4: an error raised on a listening server (a failed accept, for example),
   // or one raised while a shutdown is already running, must stop acceptance and
   // drain through the guarded shutdown path rather than dropping in-flight
-  // requests; routing it through shutdown() also escalates the pending outcome
-  // to failure when a shutdown is already under way.
-  if (server.listening || shuttingDown) { shutdown('server error', EXIT_FAILURE); return; }
-  // A bind failure never accepted a connection, so there is nothing to drain and
-  // no handle is left open. Record the failure status and let the drained loop
-  // end the process, which keeps this diagnostic from being truncated by an
-  // immediate process.exit().
-  recordExitIntent(EXIT_FAILURE);
+  // requests.
+  if (server.listening || shuttingDown) { shutdown('server error', 1); return; }
+  // RC1: a bind failure never accepted a connection, so there is nothing to
+  // drain and the process ends immediately with a failure status.
+  process.exit(1);
 });
 
-// RC3/RC5: protocol-level rejection surface. Two classes of inbound request never reach
-// the request callback above: Node dispatches CONNECT to the server-level 'connect' event
-// and hands parser failures to 'clientError'. Both are answered here, on the bare socket,
-// with the same standardized plain-text contract the request callback applies. Registering
-// these listeners also takes ownership of the connection: once a listener exists Node
-// neither writes its own default response nor destroys the socket.
-const REJECTED_SOCKET_LINGER_MS = 1000;
-
-// Builds a complete raw HTTP/1.1 response for sockets that have no `http.ServerResponse`
-// attached. `extraHeaders` carries response-specific headers (for example `Allow`) and is
-// emitted ahead of the fixed Content-Type/Content-Length/Connection headers.
-function buildRawResponse(statusCode, statusMessage, body, extraHeaders) {
-  const headerLines = [`HTTP/1.1 ${statusCode} ${statusMessage}`]
-    .concat(extraHeaders || [])
-    .concat([
-      'Content-Type: text/plain',
-      `Content-Length: ${Buffer.byteLength(body)}`,
-      'Connection: close',
-    ]);
-  return `${headerLines.join('\r\n')}\r\n\r\n${body}`;
-}
-
-// RC1/RC4: reports whether a response for the socket's current exchange is still open, so
-// a raw write can never be interleaved into one. Node attaches the in-progress
-// `http.ServerResponse` to the socket for the duration of an exchange and detaches it once
-// that response finishes, which is what distinguishes a response that is still being
-// written from one that has already completed. A byte counter cannot make that distinction:
-// `socket.bytesWritten` accumulates over the socket's whole lifetime, so it stays non-zero
-// for every reused keep-alive connection and would silence the rejection for the rest of
-// that connection's life. A response object without a readable ended state is treated as
-// open, which is the conservative answer.
-function responseInFlight(socket) {
-  const openResponse = socket._httpMessage;
-  return Boolean(openResponse) && openResponse.writableEnded !== true;
-}
-
-// RC1/RC4: writes a raw response and then releases the socket, returning whether the
-// response was actually sent so callers log what happened rather than what was intended.
-// An error listener is attached first because a socket handed to these listeners carries
-// none of its own, and without one a late ECONNRESET/EPIPE would surface as an uncaught
-// exception. The write is made only while the socket is still writable and no response for
-// the current exchange is still open, so a response mid-stream can never be corrupted
-// while a connection that has merely completed earlier exchanges is still answered;
-// passing a null response skips the write deliberately. Either way the socket is released:
-// it is destroyed once the response flushes and, through an unref'd linger timer that
-// cannot hold up a graceful shutdown, even if it never does.
-function rejectSocket(socket, rawResponse) {
-  if (!socket || socket.destroyed) {
-    return false;
-  }
-  socket.on('error', (err) => { console.error('Rejected socket error:', err); });
-  if (rawResponse && socket.writable && !responseInFlight(socket)) {
-    socket.end(rawResponse, () => { socket.destroy(); });
-    setTimeout(() => { socket.destroy(); }, REJECTED_SOCKET_LINGER_MS).unref();
-    return true;
-  }
-  socket.destroy();
-  return false;
-}
-
-// RC5: maps a parser or timeout failure code to the status it is answered with. Codes are
-// the ones Node's HTTP parser emits (verified on Node v22): oversized headers, chunk
-// extension overflow and the headers/request timeout each get their specific status, and
-// every other malformed request gets 400 — the status Node itself would use, but with a
-// Content-Type and a body.
-function clientErrorResponse(code) {
-  switch (code) {
-    case 'HPE_HEADER_OVERFLOW':
-      return { statusCode: 431, statusMessage: 'Request Header Fields Too Large' };
-    case 'HPE_CHUNK_EXTENSIONS_OVERFLOW':
-      return { statusCode: 413, statusMessage: 'Payload Too Large' };
-    case 'ERR_HTTP_REQUEST_TIMEOUT':
-      return { statusCode: 408, statusMessage: 'Request Timeout' };
-    default:
-      return { statusCode: 400, statusMessage: 'Bad Request' };
-  }
-}
-
-// RC3: CONNECT is a valid HTTP method that Node routes to this event instead of the
-// request callback, so without this listener it escapes the GET/HEAD allow-list entirely
-// and the connection is closed with no response at all. Reject it with exactly the 405
-// contract every other unsupported method receives.
-server.on('connect', (req, socket) => {
-  const allowHeader = 'Allow: GET, HEAD';
-  const response = buildRawResponse(405, 'Method Not Allowed', 'Method Not Allowed\n', [allowHeader]);
-  if (rejectSocket(socket, response)) {
-    console.error('CONNECT is not supported: responded 405 and closed the socket.');
-  } else {
-    console.error('CONNECT is not supported: the socket could not take a response, released it.');
-  }
-});
-
-// RC5: malformed HTTP — a bad request line, an invalid header token, oversized headers, a
-// malformed chunk — and header/request timeouts all fail inside the parser, before the
-// request callback, where Node's default answer is a bare status line with no Content-Type
-// and no body. Answer each one deterministically instead. Only `err.code` is logged: the
-// parser error also carries `rawPacket`, which must never reach the log or the client.
-server.on('clientError', (err, socket) => {
-  const code = (err && err.code) || 'UNKNOWN';
-  if (code === 'ECONNRESET' || !socket || !socket.writable) {
-    console.error(`Client protocol error (${code}): peer is gone, releasing the socket.`);
-    rejectSocket(socket, null);
-    return;
-  }
-  const { statusCode, statusMessage } = clientErrorResponse(code);
-  const response = buildRawResponse(statusCode, statusMessage, `${statusMessage}\n`);
-  // A parser failure can also arrive while a response is still mid-stream — a pipelined
-  // request failing before the previous response has finished, for instance. Writing into
-  // that response would corrupt it, so the socket can only be released, and the log records
-  // which of the two happened. A failure on a connection whose earlier exchanges have all
-  // completed is answered normally.
-  if (rejectSocket(socket, response)) {
-    console.error(`Client protocol error (${code}): responded ${statusCode} and closed the socket.`);
-  } else {
-    console.error(`Client protocol error (${code}): a response was mid-stream, released the socket without one.`);
-  }
-});
-
-// RC1: listen() validates its arguments synchronously and throws — rather than
-// emitting 'error' — for an out-of-range, fractional, negative or infinite port,
-// so the call itself is guarded and the failure context is preserved.
+// RC1: a bind failure — the address already in use, insufficient privileges, an
+// address that cannot be bound — is asynchronous and reaches the server 'error'
+// listener above. listen() also validates its arguments and the server's own
+// state synchronously, throwing instead of emitting: a value that survives
+// `Number(process.env.PORT) || 3000` but is out of range or fractional is
+// rejected by listen() itself, not before it. This try/catch keeps that
+// synchronous failure on the startup reporting path: uncaught, it would reach the
+// process-level `uncaughtException` net above, which drains a running server and
+// would report a server that never began listening as a failed graceful shutdown.
 try {
   server.listen(port, hostname, () => {
     console.log(`Server running at http://${hostname}:${port}/`);
   });
 } catch (err) {
-  console.error('Server error:', err);
-  recordExitIntent(EXIT_FAILURE);
+  console.error(`Server error: ${describeError(err)}`);
+  process.exit(1);
 }
