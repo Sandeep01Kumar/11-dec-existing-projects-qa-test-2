@@ -30,6 +30,16 @@ const SHUTDOWN_TIMEOUT_MS = 10000;
 // for the same reason the deadlines themselves are set here.
 const CONNECTIONS_CHECK_INTERVAL_MS = 5000;
 
+// RC5: the headers every response carries whatever its status. They are applied
+// by the responder below rather than repeated in each call site's header map, so
+// the set is stated once and a response class added later cannot silently omit
+// it. `nosniff` is the whole of that set: it holds a browser to the declared
+// Content-Type instead of letting it infer a type from the body, and a response
+// declaring `text/plain` is still one a browser may otherwise decide to treat as
+// something else. A call site that needs its own value for one of these headers
+// still wins, because its map is applied after this one.
+const BASE_RESPONSE_HEADERS = { 'X-Content-Type-Options': 'nosniff' };
+
 // RC1: no thrown value or rejection reason is ever handed to `console.*`, which
 // would render its message, stack, `cause` chain and every enumerable property —
 // any of which can carry a credential or personal data — and would consult a
@@ -188,6 +198,62 @@ function logClientFault(label, err) {
   console.error(`${label}: ${describeError(err)}`);
 }
 
+// RC3: RFC 7230 §5.4 defines a `Host` field-value as `uri-host [ ":" port ]`, over
+// the host grammar of RFC 3986 §3.2.2 — a bracketed IP-literal, an IPv4 address,
+// or a reg-name of unreserved characters, sub-delims and percent-encoded octets.
+// This pattern is that grammar and nothing wider, so the values the check below
+// refuses are the ones the specification itself calls invalid rather than a house
+// preference: an empty value, one carrying an inner space, a port with no host
+// before it, userinfo or a path appended to the authority, and a value outside the
+// grammar the parser passed through, such as one bearing a non-ASCII byte. Each
+// branch is length-bounded rather than open-ended — 45 characters is the longest
+// IPv6 literal text and 255 the longest DNS name — so an arbitrarily long value is
+// refused on its length instead of being scanned in full, and no branch shares a
+// leading character with another, so no value can make the match backtrack.
+const HOST_PATTERN = /^(?:\[[0-9A-Fa-f:.]{2,45}\]|(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2}){1,255})(?::[0-9]{1,5})?$/;
+
+// RC3: whether the request carries exactly one `Host` field with a valid value.
+// Occurrences are counted in `req.rawHeaders`, which keeps every field line as it
+// arrived, because `req.headers.host` collapses several of them to the FIRST one:
+// answering a request that carried two conflicting `Host` fields would mean
+// answering on a value that need not be the one anything in front of this server
+// read, which is the disagreement RFC 7230 §5.4 requires a server to refuse rather
+// than resolve on the sender's behalf. An absent field is a defect only from
+// HTTP/1.1, the version that made it mandatory, so it is refused for that version
+// and tolerated for HTTP/1.0; Node's own parser already rejects the HTTP/1.1 case
+// ahead of this handler, and stating the rule here makes the handler's answer
+// correct on its own terms rather than by inheritance from the runtime.
+function hasValidHostField(req) {
+  const raw = req.rawHeaders;
+  let occurrences = 0;
+  for (let i = 0; i < raw.length; i += 2) {
+    // The length is tested first because only a four-character field name can be
+    // `host`, so a peer sending many long header names cannot make this loop spend
+    // a lowercased copy of each one to find that out.
+    if (raw[i].length === 4 && raw[i].toLowerCase() === 'host') {
+      occurrences += 1;
+      if (occurrences > 1) return false;  // more than one Host field
+    }
+  }
+  const host = req.headers.host;
+  if (host === undefined) return req.httpVersionMajor === 1 && req.httpVersionMinor === 0;
+  return HOST_PATTERN.test(host);
+}
+
+// RC3: RFC 7230 §5.3 admits exactly four request-target forms, and only two of them
+// can reach a GET or HEAD here: origin-form, which always begins with `/`, and
+// absolute-form, a scheme followed by `://` and an authority. Authority-form is
+// refused by Node's own parser before this handler, and asterisk-form is defined
+// only for a server-wide OPTIONS. This pattern tests which form a target is in and
+// nothing whatever about its content — no path is inspected, compared or routed on
+// — so a target belonging to no form is refused as the malformed request line it
+// is, while every well-formed path keeps answering identically. Matching only the
+// start is the whole of the test: the characters a target may contain are the
+// parser's business, and it has already rejected the ones HTTP forbids. The scheme
+// is left unconstrained beyond its own grammar because an origin server ignores
+// the authority of an absolute-form target rather than acting on it.
+const REQUEST_TARGET_PATTERN = /^(?:\/|[A-Za-z][A-Za-z0-9+.-]*:\/\/)/;
+
 const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHECK_INTERVAL_MS }, (req, res) => {
   // RC1: every response this handler produces — success or failure — is written by
   // this one-shot, state-aware responder, so each request yields exactly one
@@ -227,6 +293,14 @@ const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHEC
     }
     try {
       res.statusCode = statusCode;
+      // RC5: the baseline first and the caller's map second, so setHeader's
+      // overwrite leaves a call site holding whatever value it passed for a
+      // header the baseline also names. Both loops sit inside this try, so a
+      // failure to set either kind stays on the escalation path below instead of
+      // bypassing it.
+      for (const [name, value] of Object.entries(BASE_RESPONSE_HEADERS)) {
+        res.setHeader(name, value);
+      }
       for (const [name, value] of Object.entries(headers)) {
         res.setHeader(name, value);
       }
@@ -265,22 +339,72 @@ const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHEC
   });
 
   try {
+    // RC3: input validation of the request line and of the `Host` field, ahead of
+    // the dispatch below, because a message that is not a well-formed HTTP/1.x
+    // request has no method or target worth dispatching on — answering it at all,
+    // even with the 405 the allow-list would give it, treats malformed input as a
+    // well-formed request for something. Node's own parser refuses most malformed
+    // forms before this handler is reached; these two are the ones it accepts and
+    // hands over, so they are refused here, through the same bounded, generic 400
+    // every other client-fault path in this file returns.
+    //
+    // An HTTP/0.9 simple request carries no version and no header section, so it is
+    // not a valid HTTP/1.1 message and cannot be answered as one: its client reads
+    // no status line and no header block, and would render the ones written back to
+    // it as body text. Refusing it also keeps this server from being the lenient
+    // end of a chain that disagrees with a proxy about where one message ends.
+    if (req.httpVersionMajor < 1) {
+      respond(400, { 'Content-Type': 'text/plain' }, 'Bad Request\n');
+      return;
+    }
+    // A duplicate, empty or out-of-grammar `Host` is what RFC 7230 §5.4 requires a
+    // 400 for, and it is required whatever this endpoint itself reads: the field
+    // names the authority a request was addressed to, so accepting a value this
+    // server would resolve differently from whatever sits in front of it is the
+    // standing precondition for Host-header poisoning and for a front-end and a
+    // back-end disagreeing about which request they are handling. It is refused
+    // here rather than left to the deployment, so the guarantee belongs to the
+    // server itself and not to the fact that nothing currently routes on the value.
+    if (!hasValidHostField(req)) {
+      respond(400, { 'Content-Type': 'text/plain' }, 'Bad Request\n');
+      return;
+    }
     // RC3: input validation — GET and HEAD are the only methods this endpoint
     // serves, and a rejection advertises them in `Allow` so a client can correct
-    // the request rather than guess at what is supported. The rejection covers every
-    // method the Node HTTP layer delivers to this listener, which is the whole of
-    // what this handler is able to answer: a malformed method token is answered 400
-    // by Node's own request parser before the request reaches here, and CONNECT is
-    // routed to the server's 'connect' event rather than to a request listener, so
-    // with no listener for it Node closes the tunnel attempt itself. Both of those
-    // stay with the protocol layer, because answering them with this 405 would mean
-    // adding a connect responder — surface beyond the specified change.
+    // the request rather than guess at what is supported. This covers every method
+    // the Node HTTP layer delivers to a request listener, which is not quite every
+    // method a client can send: an unrecognised method token is rejected by Node's
+    // request parser before the request reaches here, and CONNECT is routed to the
+    // server's 'connect' event rather than to a request listener. Both are refused
+    // with this same 405, byte for byte, by the protocol-layer listeners registered
+    // near the end of this file — so the contract holds for every request form the
+    // server can observe, not only for the subset that arrives here. A method token
+    // that is genuinely malformed rather than merely unsupported still earns the
+    // parser's 400 there; that distinction is drawn where those listeners are.
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       respond(405, { 'Allow': 'GET, HEAD', 'Content-Type': 'text/plain' }, 'Method Not Allowed\n');
       return;
     }
-    // RC3/RC5: dispatch is method-only by contract; the request target is not a
-    // dispatch input, so GET and HEAD answer every path with the same greeting.
+    // RC3: the request target is checked for its form before a greeting is written.
+    // Dispatch here is method-only by contract, so without this check a target that
+    // is no valid request target at all would be answered as though it were an
+    // ordinary path: the asterisk-form `*`, which RFC 7230 §5.3.4 reserves for a
+    // server-wide OPTIONS, and equally a variant such as `*?x=1` that belongs to no
+    // form the specification defines and that a check for the single character `*`
+    // would wave through. What is refused is the form and not any path — `/`,
+    // `/anything`, a deep or percent-encoded path, a scheme-relative `//host` and a
+    // path that merely contains an asterisk all keep answering with the same
+    // greeting, and no path routing is introduced. The check sits below the
+    // allow-list because `OPTIONS *`, the one request line the asterisk-form is
+    // defined for, asks for a method this endpoint does not serve, and the 405 the
+    // allow-list already gives it, naming what is served in `Allow`, is the more
+    // specific of the two answers.
+    if (!REQUEST_TARGET_PATTERN.test(req.url)) {
+      respond(400, { 'Content-Type': 'text/plain' }, 'Bad Request\n');
+      return;
+    }
+    // RC3/RC5: dispatch is otherwise method-only by contract; no path is a dispatch
+    // input, so GET and HEAD answer every path with the same greeting.
     // Preserve original behavior: 200 text/plain "Hello, World!".
     if (req.method === 'HEAD') {
       respond(200, { 'Content-Type': 'text/plain' });
@@ -413,6 +537,235 @@ server.on('error', (err) => {
   // RC1: a bind failure never accepted a connection, so there is nothing to drain
   // and the process ends immediately with a failure status.
   process.exit(1);
+});
+
+// RC1/RC3: the protocol layer's share of the method contract. Two request forms
+// never reach the request listener above, so the 405 it writes cannot cover
+// them, and each was answered in a way the contract does not describe: a method
+// token Node's request parser does not recognise is rejected before any
+// application code runs, which sent a bare 400 carrying no `Allow` and naming
+// nothing the endpoint accepts, and CONNECT is routed to the server's 'connect'
+// event, which with no listener registered destroyed the socket without sending
+// a single byte. Both are answered here with the same 405 the handler writes, so
+// "every method other than GET and HEAD is refused with 405 and an `Allow`
+// header" holds for every request form this server can observe rather than only
+// for the subset the parser hands upward.
+//
+// Neither path has a ServerResponse to write through — the parser has rejected
+// the message, or the connection was claimed for a tunnel — so both responses
+// are assembled as raw bytes here. That is why the status line and every header
+// are spelled out in full instead of being set through the response helpers
+// above, and why the byte sequence is kept identical to the handler's 405 down
+// to the header order: which layer refused a request is this server's business,
+// not something a client should be able to read off the response.
+//
+// Deliberately not registered: an 'upgrade' listener. With none, Node delivers a
+// request carrying `Upgrade` to the request listener as the ordinary GET it also
+// is and never switches protocols, which RFC 7230 §6.7 explicitly permits and
+// which is the behavior this endpoint wants; claiming those sockets here would
+// replace a correct 200 with a refusal.
+const PROTOCOL_405_BODY = 'Method Not Allowed\n';
+
+// RC3: the method tokens this refusal applies to. The parser raises the same
+// invalid-method error for a legitimate extension method it happens not to know
+// and for a request line that is not HTTP at all, so the two are separated on
+// the shape of what arrived rather than on the error code: the whole request
+// line must be well-formed, and its method must be a bounded, uppercase RFC 7230
+// token. A lowercase `get`, a 200-character token, `GE T`, an absent method and
+// binary noise therefore keep the 400 they earn — they are malformed, not merely
+// unsupported — and nothing is answered 405 on the strength of its first few
+// bytes alone. The scan window bounds the work done on a rejected packet, which
+// may be as large as the runtime's whole header ceiling.
+const PROTOCOL_REQUEST_LINE_SCAN_BYTES = 8192;
+const UNSUPPORTED_METHOD_REQUEST_LINE = /^[A-Z][A-Z0-9!#$%&'*+.^_`|~-]{0,19} [\x21-\x7e]{1,4096} HTTP\/1\.[01]\r\n/;
+
+// RC1: Node's own client-error replies, reproduced verbatim because registering
+// a 'clientError' listener suppresses the whole of its default handling — the
+// listener below is then answerable for every request the parser rejects, not
+// just the one case it changes. Each of these is the exact byte sequence this
+// runtime sends for that error: a malformed message, a header block past the
+// size ceiling, oversized chunk extensions, and a request that never completed
+// inside its deadline. Verbatim is the whole of the intent, so the baseline
+// response headers are deliberately not added to these four: each carries no body
+// and declares no Content-Type, which is the only thing the baseline's `nosniff`
+// acts on, and altering the bytes this runtime already sends for a parser
+// rejection would change cases this listener exists to leave alone.
+const PROTOCOL_400_RESPONSE = 'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n';
+const PROTOCOL_431_RESPONSE = 'HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n';
+const PROTOCOL_413_RESPONSE = 'HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\n\r\n';
+const PROTOCOL_408_RESPONSE = 'HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n';
+
+// RC1: selects the reply for one parser error code. A switch rather than a
+// lookup table, so a code that happens to name an inherited object property
+// cannot resolve to anything other than the generic rejection.
+function protocolErrorResponse(code) {
+  switch (code) {
+    case 'HPE_HEADER_OVERFLOW': return PROTOCOL_431_RESPONSE;
+    case 'HPE_CHUNK_EXTENSIONS_OVERFLOW': return PROTOCOL_413_RESPONSE;
+    case 'ERR_HTTP_REQUEST_TIMEOUT': return PROTOCOL_408_RESPONSE;
+    default: return PROTOCOL_400_RESPONSE;
+  }
+}
+
+// RC5: the responder's baseline headers, rendered as raw header lines for the
+// responses this layer has to assemble by hand. The set itself is declared once,
+// in BASE_RESPONSE_HEADERS, and the responder applies it ahead of each call
+// site's own map, so it precedes those headers on the wire; emitting it in that
+// same position here is what keeps this layer's 405 byte-identical to the
+// handler's rather than merely similar to it. The lines are derived from that one
+// constant rather than restated, because a second literal copy is exactly what
+// would silently miss a header added to the baseline later.
+function baseResponseHeaderLines() {
+  let lines = '';
+  for (const [name, value] of Object.entries(BASE_RESPONSE_HEADERS)) {
+    lines += `${name}: ${value}\r\n`;
+  }
+  return lines;
+}
+
+// RC3/RC5: the 405 as a complete, self-terminating HTTP/1.1 message, carrying
+// the same headers in the same order and the same body as the handler's 405, so
+// the two differ only in the instant each was generated at. That identity is the
+// point rather than a nicety: which layer refused a request is this server's
+// business, and a header present on one of the two 405s and absent from the other
+// is enough to read it off the response, so the baseline headers every response
+// carries are emitted here too, in the position the responder puts them in.
+// `Content-Length` and `Connection: close` are what make it unambiguous on a
+// socket that is about to be released, and `Date` is what every other response
+// from this server carries.
+function protocol405Response() {
+  return 'HTTP/1.1 405 Method Not Allowed\r\n' +
+    baseResponseHeaderLines() +
+    'Allow: GET, HEAD\r\n' +
+    'Content-Type: text/plain\r\n' +
+    `Date: ${new Date().toUTCString()}\r\n` +
+    'Connection: close\r\n' +
+    `Content-Length: ${Buffer.byteLength(PROTOCOL_405_BODY)}\r\n` +
+    '\r\n' +
+    PROTOCOL_405_BODY;
+}
+
+// RC1: a socket answered at this layer carries no ServerResponse, and on the
+// 'connect' path it arrives with no 'error' listener of Node's own either, so
+// one is supplied: a reset from a peer that has already gone would otherwise be
+// emitted as an unhandled 'error' event and reach the process-level net, taking
+// a healthy server down over one refused probe. It is attached only when the
+// socket has none, so the client-error path — where Node has already attached
+// its own — keeps behaving exactly as it did, and the fault is recorded through
+// the rate-limited client-fault path because it is remotely triggerable.
+function guardSocketErrors(socket) {
+  if (socket.listenerCount('error') === 0) {
+    socket.on('error', (err) => logClientFault('Protocol socket error', err));
+  }
+}
+
+// RC1/RC4: whether a raw response may still be put on this socket. One that is
+// no longer writable is out of the question, and a response must never be
+// appended to a message that is part-way through transmission — that would
+// corrupt what its client is mid-way through reading. A message whose end() has
+// already been called is complete, so a response after it is an ordinary
+// pipelined response rather than corruption, which is what lets a refusal still
+// reach a client that pipelined the refused request behind a served one.
+// `_httpMessage` is the same state the runtime's own client-error default
+// consults to make this decision.
+function canWriteRawResponse(socket) {
+  if (!socket.writable) return false;
+  const inFlight = socket._httpMessage;
+  return !(inFlight && inFlight.headersSent && !inFlight.writableEnded);
+}
+
+// RC4: writes one terminal raw response and releases the socket. The FIN travels
+// with the bytes and the handle is destroyed as soon as they are flushed, so a
+// refused connection is never left half-open waiting on a peer that may never
+// close its own end, and nothing about it survives the exchange.
+function endWithRawResponse(socket, response) {
+  guardSocketErrors(socket);
+  try {
+    if (!canWriteRawResponse(socket)) {
+      socket.destroy();                     // nothing can be delivered; just release it
+      return;
+    }
+    socket.end(response, () => { if (!socket.destroyed) socket.destroy(); });
+  } catch (err) {
+    // RC1: the refusal itself failing is still only one connection's problem.
+    logClientFault('Protocol response write error', err);
+    if (!socket.destroyed) socket.destroy();
+  }
+}
+
+// RC3: true only for the one client error the 405 applies to — the parser
+// rejected the method token, and what it rejected is otherwise a well-formed
+// request line.
+//
+// The packet handed over is the whole segment the parser was reading, which may
+// carry earlier complete messages ahead of the one that failed, so the request
+// line is located rather than assumed: parsing stopped inside the offending
+// method token, and the line that token belongs to begins after the last CRLF at
+// or before that point. Testing the packet's first bytes instead would test the
+// wrong request — a valid GET pipelined ahead of binary noise reads as a
+// well-formed request line and would earn the noise a 405.
+//
+// The packet is read defensively besides: it is raw bytes a peer sent, so it is
+// examined only as a bounded prefix, only when it really is a buffer, and never
+// in a way that can raise a second failure out of this path.
+function isUnsupportedMethodToken(err) {
+  if (readErrorToken(err, 'code') !== 'HPE_INVALID_METHOD') return false;
+  try {
+    const packet = err.rawPacket;
+    if (!Buffer.isBuffer(packet)) return false;
+    const head = packet.subarray(0, PROTOCOL_REQUEST_LINE_SCAN_BYTES).toString('latin1');
+    const stopped = Number.isInteger(err.bytesParsed) && err.bytesParsed > 0
+      ? Math.min(err.bytesParsed, head.length)
+      : 0;
+    const boundary = head.lastIndexOf('\r\n', stopped);
+    return UNSUPPORTED_METHOD_REQUEST_LINE.test(boundary === -1 ? head : head.slice(boundary + 2));
+  } catch {
+    return false;                           // an unreadable packet names no method
+  }
+}
+
+// RC3: CONNECT asks this server to become a tunnel, which it does not offer, so
+// the request is refused with the ordinary 405 and the connection is closed
+// without ever being upgraded. The bytes the peer sent after the request line
+// are handed to this listener as a third argument and are deliberately left
+// unread, so nothing a peer sends is relayed anywhere and no tunnel exists at
+// any point — the refusal is now observable where previously the peer received
+// nothing at all.
+server.on('connect', (req, socket) => {
+  endWithRawResponse(socket, protocol405Response());
+});
+
+// RC1/RC3: every request the parser rejects arrives here, and registering this
+// listener means Node no longer answers any of them itself. One case is answered
+// differently from its default and every other exactly as before: a well-formed
+// request line whose method is an unrecognised token now gets the 405 its
+// unsupported method earns, with the `Allow` header that tells the client what
+// this endpoint does accept, instead of a bare 400 that told it nothing. The
+// parser is left strict — nothing here relaxes what it accepts — so every
+// malformed message it refuses stays refused, on the same bytes as before.
+server.on('clientError', (err, socket) => {
+  try {
+    if (isUnsupportedMethodToken(err)) {
+      endWithRawResponse(socket, protocol405Response());
+      return;
+    }
+    guardSocketErrors(socket);
+    // Node's default, reproduced: reply only while no response is in flight with
+    // its header block already on the wire — appending to one would corrupt the
+    // message its client is part-way through reading — and then release the
+    // socket. `_httpMessage` is the same state the runtime's own default handler
+    // consults for that decision. The failure is not re-emitted onto the socket
+    // by destroy(): it is already in hand here, and re-emitting it is the one way
+    // this path could raise an 'error' event with nothing left to handle it.
+    const inFlight = socket._httpMessage;
+    if (socket.writable && !(inFlight && inFlight.headersSent)) {
+      socket.write(protocolErrorResponse(readErrorToken(err, 'code')));
+    }
+    socket.destroy();
+  } catch (responseErr) {
+    logClientFault('Client error response failed', responseErr);
+    if (!socket.destroyed) socket.destroy();
+  }
 });
 
 // RC1: a bind failure is asynchronous and reaches the server 'error' listener
